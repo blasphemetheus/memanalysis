@@ -3,219 +3,158 @@ defmodule Memanalysis do
   Documentation for `Memanalysis`.
   """
 
-  # BELIEVER SAYS USE STREAM.CHUNK and I did look at it, but became confused,
-  # So here's the
-  #
-  # INFO FROM WHITEPOISON
+  # looking for addresses of memory relevant to game state
+  # stage objects (items, fighters, stage itself, articles, projectiles etc)
+  # that can impact game state
 
-  # Relevant to Game state -> we're looking for addresses of memory that fits that
-  # so stage objects can directly impact
-  # stage objects -> items, fighters, stage itself, articles, projectiles etc
+  # Stuff present in frames from around start of match
+  # until around the end of the match,
+  # then rev eng what allocation translates to in-game
 
-  # So, look at the output and look for stuff that's there from around the start of the match
-  # until around the end of the match, and RE what that allocation actually is in the game
-
-  # To produce these files, I started by running a function called DumpAll,
-  # which prints every allocation in the game to OSReport, every frame of the replay
-  # And redirected the output to a file on dolphin side
-  # I then ran a script that produces the output files
-  # Essentially just rearranging the information
+  # To make output files, run fn called DumpAll,
+  # prints every allocation in the game to OSReport,
+  # every frame of the replay.
+  # Redirects output to a file on dolphin side
+  # A python script then produces the output files
+  # Just rearranging the information
 
 
   # GOOD READING: https://hansonkd.medium.com/building-beautiful-binary-parsers-in-elixir-1bd7f865bf17
 
   @keys ["NUM FRAMES: ", "\n", "KEY: ", "VALUE: ", "[", "(", "RANGE: ", "SIZE: ", "FRAMES REFERENCED: ", "]", ")", ]
-  def main(:stream) do
+
+  def main() do
+    main(:sync, :test)
+    for i <- 0..16, do: main(:sync, i)
+    IO.puts("COMPLETELY FINISHED")
+    for _i <- 0..5, do: IO.puts("____________________________________")
+  end
+  def main(:stream!) do
     # this doesn't really work atm, still figuring out what's actually different about Streams
     # I know Stream.map() is basically Enum.map() but evaluated lazily, but
     # making the parse stuff gel with Streams is the next task
-    stream = streamin(:output, 0)
+    stream = intake(:output, 0, :stream!)
 
     hits_keyword = &(&1 in @keys)
     Stream.chunk_by(stream, hits_keyword)
     |> Stream.take(1)
   end
 
-  def main() do
+  def main(:async) do
+    {:ok, bin} = Memanalysis.intake(:output, 0)
+    Smahty.smart_parse(bin)
+  end
+
+  def main(:sync, num \\ :test) do
+    {:ok, start} = DateTime.now("Etc/UTC")
+    IO.puts("Start file #{num}__ minute: #{start.minute}, second: #{start.second}")
+    n = num
     # using number three as my example here,
     # go ahead and try this in iex if you want (with different output files)
     # (`iex -S mix` to start it up, `iex.bat -S mix` in Powershell)
-    {:ok, bin} = Memanalysis.readin(:output, 3)
-    {num_frames_list, key_value_list} = Memanalysis.parse(bin) |> Enum.split(1)
+    {:ok, bin} = Memanalysis.intake(:output, n, :read)
+    parsed = Parse.parse(bin)
 
-    {:num_frames, num_frames} = num_frames_list |> List.first()
+    {num_frames, kv_list_chunked} = Watchlist.chunk(parsed)
 
-    key_value_list |> Enum.chunk_every(2)
+    key_value_list = kv_list_chunked
+    |> Watchlist.filter_key_vals_for_some_percent_of_frames(num_frames, 0.7)
+
+    watchlist_kv = Watchlist.convert_key_value_list_to_watchlist(key_value_list, num_frames)
+    |> Watchlist.fill_in_baseIndex()
+
+    output = {"watchList", watchlist_kv}
+    |> stringify()
+
+    output
+    |> sendToFile("dump_watchlist#{n}.dmw")
+
+    case n do
+      :test -> IO.puts(output)
+      _ -> IO.puts("done")
+    end
+
+    {:ok, finish} = DateTime.now("Etc/UTC")
+    IO.puts("Start __ minute: #{start.minute}, second: #{start.second}")
+    IO.puts("End __ minute: #{finish.minute}, second: #{finish.second}")
+
+    #{num_frames_list, key_value_list} = parsed |> Enum.ssplit(1)
+    #{:num_frames, num_frames_decimal} = num_frames_list |> List.first()
+    #IO.puts("The number of frames is : #{num_frames_decimal}")
+    # so now we process the key value list
+    #key_value_list |> Enum.chunk_every(2)
+    #|> Enum.map(fn list_of_key_then_value ->
+    #  list_of_key_then_value
+    #end)
+  end
+
+  def stringify(cool) do
+    cool
+    |> Watchlist.make_tuples_nested_tuples()
+    |> inspect(limit: :infinity)
+    |> String.replace("\",", "\":")
+    |> bracket_replace()
+  end
+
+  def bracket_replace("{{" <> rest) do
+    "{" <> bracket_replace(rest)
+  end
+  def bracket_replace("}}" <> rest) do
+    "}" <> bracket_replace(rest)
+  end
+  def bracket_replace("{" <> rest) do
+    bracket_replace(rest)
+  end
+  def bracket_replace("}" <> rest) do
+    bracket_replace(rest)
+  end
+  def bracket_replace("") do
+    ""
+  end
+  def bracket_replace(<<t>> <> rest) do
+    <<t>> <> bracket_replace(rest)
   end
 
   @doc """
-  Reads in the memory files as specified
+  intakes a csv or output txt file (logs in different formats)
+  either as a Stream (which raises exceptions on error), (with style :stream!)
+  or as a binary held in memory (with style :read)
 
   ## Examples
 
-      iex> Memanalysis.readin(:output, 54)
+      iex> Memanalysis.intake(:output, 54, :read)
       {:error, :enoent}
   """
-  def readin(:mem_dump) do
-    {:ok, _f} = File.read("mem_dump.csv")
-  end
+  def intake(atom, n \\ :test, style \\ :read)
+  def intake(:csv, _n, :read), do: {:ok, _f} = File.read("mem_dump.csv")
+  def intake(:csv, _n, :stream!), do: File.stream!("mem_dump.csv")
+  def intake(:output, :test, :read), do: {:ok, _f} = File.read("ProjectPlusMemory/outputtest.txt")
+  def intake(:output, :test, :stream!), do: File.stream!("ProjectPlusMemory/outputtest.txt")
 
-  def readin(:output, :test) do
-    {:ok, _f} = File.read("ProjectPlusMemory/outputtest.txt")
-  end
-
-  def readin(:output, n) when n > -1 and n < 17 do
+  def intake(:output, n, :read) when n > -1 and n < 17 do
     {:ok, _f} = File.read("ProjectPlusMemory/output#{n}.txt")
   end
 
-  def readin(:output, n) do
-    raise ArgumentError, message: "Please specify an output file between 0 and 16 inclusive: got #{inspect(n)}"
-  end
-
-  def streamin(:output, n) when n > -1 and n < 17 do
+  def intake(:output, n, :stream!) when n > -1 and n < 17 do
     File.stream!("ProjectPlusMemory/output#{n}.txt")
   end
 
-  def parse(bin) do
-    p(bin, [])
-  end
-
-
-  def p("", acc) do
-    Enum.reverse(acc)
-  end
-
-  def p("\r\n", acc), do: Enum.reverse(acc)
-
-  def p("NUM FRAMES: " <> rest, acc) do
-
-    {frames, new_rest} = parse(:num_frames, rest, [])
-    f = frames |> List.to_string() |> String.trim() |> String.to_integer() |> tupelize(:num_frames)
-    new_acc = [f | acc]
-    p(new_rest, new_acc)
-  end
-
-  def p("KEY: " <> rest, acc) do
-    {k, new_rest} = parse(:key, rest, [])
-    key = k |> normalize(:key)
-    new_acc = [key | acc]
-    p(new_rest, new_acc)
-  end
-
-  def p("\r\nKEY: " <> rest, acc), do: p("KEY: " <> rest, acc)
-
-  def p("VALUE: [" <> rest, acc) do
-    {v, new_rest} = parse(:value, rest, [])
-    value = v |> tupelize(:value)
-    new_acc = [value | acc]
-    p(new_rest, new_acc)
-  end
-
-  def parse(:num_frames, "\n" <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:key, "\r\n" <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:value, "]" <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:range, ", " <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:size, ", " <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:reffed, "]" <> rest, acc) do
-    {Enum.reverse(["]" |acc]), rest}
-  end
-
-  def parse(:item, ")\r\n, " <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:item, ")\r\n" <> rest, acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  def parse(:value, "(" <> rest, acc) do
-    {i, new_rest} = parse(:item, rest, [])
-    item = i |> tupelize(:item)
-    new_acc = [item | acc]
-    parse(:value, new_rest, new_acc)
-  end
-
-  def parse(:item, "RANGE: " <> rest, acc) do
-    {r, new_rest} = parse(:range, rest, [])
-    range = r |> normalize(:range)
-    new_acc = [range | acc]
-    parse(:item, new_rest, new_acc)
-  end
-
-  def parse(:item, "SIZE: " <> rest, acc) do
-    {s, new_rest} = parse(:size, rest, [])
-    size = s |> normalize(:size)
-    new_acc = [size | acc]
-    parse(:item, new_rest, new_acc)
-  end
-
-  def parse(:item, "FRAMES REFERENCED: " <> rest, acc) do
-    {r, new_rest} = parse(:reffed, rest, [])
-    reffed = r |> List.to_string() |> str_to_list() |> tupelize(:reffed)
-    new_acc = [reffed | acc]
-    parse(:item, new_rest, new_acc)
-  end
-
-  def parse(:reffed, <<thing>> <> rest, acc) do
-    parse(:reffed, rest, [<<thing>> | acc])
-  end
-
-  def parse(:size, <<thing>> <> rest, acc) do
-    parse(:size, rest, [<<thing>> | acc])
-  end
-
-  def parse(:num_frames, <<thing>> <> rest, acc) do
-    parse(:num_frames, rest, [<<thing>> | acc])
-  end
-
-  def parse(:key, <<thing>> <> rest, acc) do
-    parse(:key, rest, [<<thing>> | acc])
-  end
-
-  def parse(:range, <<thing>> <> rest, acc) do
-    parse(:range, rest, [<<thing>> | acc])
-  end
-
-  def parse(_atom, "", acc) do
-    {Enum.reverse(acc), ""}
-  end
-
-  def tupelize(string, atom), do: {atom, string}
-
-  def normalize(list, atom) do
-    list |> List.to_string() |> String.trim() |> tupelize(atom)
+  def intake(:output, n, _style) do
+    raise ArgumentError, message: "Please specify an output file between 0 and 16 inclusive: got #{inspect(n)}"
   end
 
   @doc """
-  Change a string which contains within it a list representation back to a list of numbers
-  This is for input of the format:
-  "[13316, 13317, 13318, 13319, 13320, 13321, 13322, 13323, 13324, 13325]"
-  to make it
-  ["13316", "13317", "13318", "13319", "13320", "13321", "13322", "13323", "13324", "13325"]
+  sends binary data to a file
   """
-  def str_to_list("[" <> str) do
-    str |> String.replace_suffix("]", "") |> String.split(", ") |> Enum.map(fn str -> String.to_integer(str) end)
+  def sendToFile(binary, path) do
+    File.write(path, binary)
+    #{:ok, f} = case File.exists?(path) do
+    ##  true -> File.open(path)
+    #  false ->
+    #    File.touch(path)
+    #    File.open(path)
+    #end
+    #IO.write(f, binary)
+    #File.write(path, binary) # for when not writing in a loop
   end
-
-  #def parseNFrames("KEY: " <> key_name <> "\n" <> rest, acc) do
-  #end
-  #String.to
-
-
-
 end
